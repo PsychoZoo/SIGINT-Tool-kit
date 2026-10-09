@@ -1,0 +1,23 @@
+# Your own programs. Merged with ../docker-compose.yml via COMPOSE_FILE in .env,
+# so paths here are relative to the repository root.
+# `./toolkit.sh new-module <name>` appends a new service to the end of this file.
+
+x-module: &module
+  restart: unless-stopped
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sigint}
+    MQTT_HOST: broker
+    MQTT_PORT: "1883"
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    db:
+      condition: service_healthy
+    broker:
+      condition: service_healthy
+
+services:
+  watchlist:
+    <<: *module
+    build:
+      context: .
+      dockerfile: modules/watchlist/Dockerfile

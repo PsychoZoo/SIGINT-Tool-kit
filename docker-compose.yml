@@ -1,0 +1,100 @@
+# Core platform. Your own programs live in modules/compose.yml, which docker
+# compose merges in automatically via COMPOSE_FILE in .env.
+#
+#   docker compose up -d                     core + modules
+#   docker compose --profile demo up -d      + simulator (fake data, no hardware)
+#   docker compose --profile sdr up -d       + rtl_433 (needs an RTL-SDR dongle)
+
+x-sigint-env: &sigint-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-sigint}
+  MQTT_HOST: broker
+  MQTT_PORT: "1883"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-sigint-depends: &sigint-depends
+  db:
+    condition: service_healthy
+  broker:
+    condition: service_healthy
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sigint}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sigint}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  broker:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    volumes:
+      - ./broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - broker-data:/mosquitto/data
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_PORT:-1883}:1883"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_WS_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ingestor:
+    build:
+      context: .
+      dockerfile: services/ingestor/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *sigint-env
+      EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-0}
+    depends_on: *sigint-depends
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment: *sigint-env
+    depends_on: *sigint-depends
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080"
+
+  simulator:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *sigint-env
+      SIM_RATE: ${SIM_RATE:-1}
+    depends_on: *sigint-depends
+
+  rtl433:
+    profiles: ["sdr"]
+    build: services/rtl433
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: broker
+      RTL433_ARGS: ${RTL433_ARGS:-}
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    depends_on:
+      broker:
+        condition: service_healthy
+
+volumes:
+  db-data:
+  broker-data:

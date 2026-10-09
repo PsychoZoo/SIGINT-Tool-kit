@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIGINT Tool-kit</title>
+<style>
+  :root { --bg:#0f1216; --panel:#171b21; --line:#262c35; --text:#d7dde4; --dim:#7d8794; --ok:#3fb950; --bad:#f85149; --accent:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  header .conn { margin-left:auto; color:var(--dim); }
+  main { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,2fr); gap:16px; padding:16px; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0,1fr); } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  section h2 { font-size:13px; margin:0; padding:8px 12px; border-bottom:1px solid var(--line); color:var(--dim); text-transform:uppercase; letter-spacing:.05em; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { text-align:left; padding:6px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:normal; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--dim); }
+  .online { background:var(--ok); } .offline { background:var(--bad); }
+  #feed { max-height:70vh; overflow:auto; }
+  #feed td.data { color:var(--dim); word-break:break-all; }
+  .k { color:var(--accent); }
+  .alert td { background:rgba(248,81,73,.12); }
+  .controls { display:flex; gap:8px; padding:8px 12px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  input, button { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:4px 8px; font:inherit; }
+  button { cursor:pointer; }
+  .stack { display:flex; flex-direction:column; gap:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SIGINT Tool-kit</h1>
+  <a href="/docs" style="color:var(--accent)">API docs</a>
+  <span class="conn" id="conn">connecting…</span>
+</header>
+<main>
+  <div class="stack">
+    <section>
+      <h2>Modules</h2>
+      <table><thead><tr><th>Name</th><th>Kind</th><th>Last seen</th></tr></thead><tbody id="modules"></tbody></table>
+    </section>
+    <section>
+      <h2>Event counts</h2>
+      <table><thead><tr><th>Module / kind</th><th>Total</th><th>Last hour</th></tr></thead><tbody id="stats"></tbody></table>
+    </section>
+  </div>
+  <section>
+    <h2>Live events</h2>
+    <div class="controls">
+      <input id="filter" placeholder="filter (module, kind or text)" size="30">
+      <button id="pause">Pause</button>
+      <button id="clear">Clear</button>
+    </div>
+    <div id="feed"><table><tbody id="events"></tbody></table></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const time = (ts) => ts ? new Date(ts).toLocaleTimeString() : "";
+let paused = false;
+const MAX_ROWS = 300;
+
+async function refresh() {
+  try {
+    const [modules, stats] = await Promise.all([
+      fetch("/api/modules").then((r) => r.json()),
+      fetch("/api/stats").then((r) => r.json()),
+    ]);
+    $("modules").innerHTML = modules.map((m) =>
+      `<tr><td><span class="dot ${esc(m.status)}"></span>${esc(m.name)}</td><td>${esc(m.kind ?? "")}</td><td>${time(m.last_seen)}</td></tr>`
+    ).join("");
+    $("stats").innerHTML = stats.map((s) =>
+      `<tr><td>${esc(s.module)} / <span class="k">${esc(s.kind)}</span></td><td>${s.total}</td><td>${s.last_hour}</td></tr>`
+    ).join("");
+  } catch (e) { /* API restarting; try again next tick */ }
+}
+
+function addEvent(ev, prepend = true) {
+  const text = `${ev.module} ${ev.kind} ${JSON.stringify(ev.data ?? {})}`;
+  const f = $("filter").value.trim().toLowerCase();
+  if (f && !text.toLowerCase().includes(f)) return;
+  const tr = document.createElement("tr");
+  if (ev.kind === "alert") tr.className = "alert";
+  tr.innerHTML = `<td>${time(ev.ts)}</td><td>${esc(ev.module)}</td><td class="k">${esc(ev.kind)}</td><td class="data">${esc(JSON.stringify(ev.data ?? {}))}</td>`;
+  const body = $("events");
+  prepend ? body.prepend(tr) : body.append(tr);
+  while (body.rows.length > MAX_ROWS) body.deleteRow(body.rows.length - 1);
+}
+
+async function loadRecent() {
+  $("events").innerHTML = "";
+  const events = await fetch("/api/events?limit=100").then((r) => r.json());
+  events.forEach((ev) => addEvent(ev, false));
+}
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/live`);
+  ws.onopen = () => { $("conn").textContent = "live"; $("conn").style.color = "var(--ok)"; };
+  ws.onmessage = (m) => { if (!paused) addEvent(JSON.parse(m.data)); };
+  ws.onclose = () => { $("conn").textContent = "reconnecting…"; $("conn").style.color = "var(--bad)"; setTimeout(connect, 2000); };
+}
+
+$("pause").onclick = () => { paused = !paused; $("pause").textContent = paused ? "Resume" : "Pause"; };
+$("clear").onclick = () => { $("events").innerHTML = ""; };
+$("filter").onchange = loadRecent;
+
+loadRecent().catch(() => {});
+refresh();
+setInterval(refresh, 5000);
+connect();
+</script>
+</body>
+</html>

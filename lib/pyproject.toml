@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigint-common"
+version = "0.1.0"
+description = "Shared message-bus and database helpers for SIGINT Tool-kit modules"
+requires-python = ">=3.10"
+dependencies = [
+    "paho-mqtt>=2.0,<3",
+    "psycopg[binary]>=3.1,<4",
+]
+
+[tool.setuptools]
+packages = ["sigint_common"]
