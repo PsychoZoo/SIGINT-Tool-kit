@@ -4,11 +4,11 @@
 
     mod = Module("my-tool", kind="sensor")
 
-    @mod.on("sigint/+/data/adsb")          # listen to another module's data
+    @mod.on("sigint/+/+/data/adsb")        # listen to other modules' data, on any node
     def handle(msg):
-        print(msg.module, msg.data)
+        print(msg.node, msg.module, msg.data)
 
-    @mod.command("scan")                   # sigint/my-tool/cmd/scan
+    @mod.command("scan")                   # sigint/<this node>/my-tool/cmd/scan
     def scan(msg):
         mod.publish("result", {"found": 3})  # stored in the events table
 
@@ -24,13 +24,16 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.properties import Properties
 
 from . import db as dbmod
-from .config import LOG_LEVEL, MQTT_HOST, MQTT_PASSWORD, MQTT_PORT, MQTT_USERNAME
+from .config import LOG_LEVEL, MQTT_HOST, MQTT_PASSWORD, MQTT_PORT, MQTT_USERNAME, NODE_NAME
 from .topics import cmd_topic, data_topic, parse_topic, status_topic
 
 log = logging.getLogger(__name__)
@@ -39,11 +42,13 @@ log = logging.getLogger(__name__)
 @dataclass
 class Message:
     topic: str
+    node: str  # device the publishing module runs on
     module: str  # module that published the message
     channel: str  # "data", "status" or "cmd"
     name: str  # data kind or command name
     data: Any  # decoded JSON, or {"raw": "..."} when the payload is not JSON
     payload: bytes
+    ts: str | None = None  # ISO time the message was created, if the sender set it
 
 
 Handler = Callable[[Message], None]
@@ -60,6 +65,14 @@ def _encode(data: Any) -> str:
     return json.dumps(data, default=str, separators=(",", ":"))
 
 
+def _timestamped() -> Properties:
+    """MQTT v5 properties carrying the creation time, so data buffered on a node
+    while its link to the master is down is stored with the time it was seen."""
+    props = Properties(PacketTypes.PUBLISH)
+    props.UserProperty = ("ts", datetime.now(timezone.utc).isoformat())
+    return props
+
+
 class Module:
     def __init__(
         self,
@@ -67,14 +80,20 @@ class Module:
         kind: str = "generic",
         meta: dict | None = None,
         heartbeat: float = 30.0,
+        persistent_session: bool = False,
     ):
+        """persistent_session: the broker keeps this module's subscriptions and
+        queues its messages while it is disconnected (e.g. restarting), so nothing
+        is missed. Only one instance per node may then run at a time."""
         logging.basicConfig(
             level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
         )
         self.name = name or os.environ["MODULE_NAME"]
+        self.node = NODE_NAME
         self.kind = kind
-        self.meta = {"host": socket.gethostname(), **(meta or {})}
+        self.meta = {"host": socket.gethostname(), "node": NODE_NAME, **(meta or {})}
         self.heartbeat = heartbeat
+        self.persistent_session = persistent_session
         self.log = logging.getLogger(self.name)
 
         self._handlers: list[tuple[str, Handler]] = []
@@ -85,7 +104,10 @@ class Module:
 
         self.client = mqtt.Client(
             CallbackAPIVersion.VERSION2,
-            client_id=f"{self.name}-{uuid.uuid4().hex[:8]}",
+            client_id=f"{NODE_NAME}-{self.name}"
+            if persistent_session
+            else f"{NODE_NAME}-{self.name}-{uuid.uuid4().hex[:8]}",
+            protocol=mqtt.MQTTv5,
         )
         if MQTT_USERNAME:
             self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
@@ -99,12 +121,14 @@ class Module:
     # -- messaging ---------------------------------------------------------
 
     def publish(self, kind: str, data: Any, retain: bool = False, qos: int = 1) -> None:
-        """Publish data on sigint/<this module>/data/<kind>; the ingestor stores it."""
-        self.client.publish(data_topic(self.name, kind), _encode(data), qos=qos, retain=retain)
+        """Publish data on sigint/<node>/<this module>/data/<kind>; the ingestor stores it."""
+        self.client.publish(
+            data_topic(self.name, kind), _encode(data), qos=qos, retain=retain, properties=_timestamped()
+        )
 
-    def send_command(self, module: str, command: str, data: Any = None) -> None:
-        """Send a command to another module (sigint/<module>/cmd/<command>)."""
-        self.client.publish(cmd_topic(module, command), _encode(data or {}), qos=1)
+    def send_command(self, module: str, command: str, data: Any = None, node: str | None = None) -> None:
+        """Send a command to a module on this node, or on another node."""
+        self.client.publish(cmd_topic(module, command, node or NODE_NAME), _encode(data or {}), qos=1)
 
     def subscribe(self, pattern: str, handler: Handler) -> None:
         self._handlers.append((pattern, handler))
@@ -121,7 +145,7 @@ class Module:
         return register
 
     def command(self, command: str = "#") -> Callable[[Handler], Handler]:
-        """Decorator: handle commands sent to this module."""
+        """Decorator: handle commands sent to this module on this node."""
         return self.on(cmd_topic(self.name, command))
 
     # -- database ----------------------------------------------------------
@@ -143,7 +167,12 @@ class Module:
 
     def start(self) -> None:
         """Connect to the broker and start the network loop in the background."""
-        self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+        if self.persistent_session:
+            props = Properties(PacketTypes.CONNECT)
+            props.SessionExpiryInterval = 7 * 24 * 3600
+            self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30, clean_start=False, properties=props)
+        else:
+            self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
         self.client.loop_start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         self.log.info("started, broker %s:%s", MQTT_HOST, MQTT_PORT)
@@ -209,13 +238,16 @@ class Module:
 
     def _on_message(self, client, userdata, msg) -> None:
         parsed = parse_topic(msg.topic)
+        user_props = dict(getattr(msg.properties, "UserProperty", None) or [])
         message = Message(
             topic=msg.topic,
+            node=parsed.node if parsed else "",
             module=parsed.module if parsed else "",
             channel=parsed.channel if parsed else "",
             name=parsed.name if parsed else "",
             data=_decode(msg.payload),
             payload=msg.payload,
+            ts=user_props.get("ts"),
         )
         for pattern, handler in self._handlers:
             if mqtt.topic_matches_sub(pattern, msg.topic):

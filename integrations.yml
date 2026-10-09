@@ -12,11 +12,17 @@
 #
 # Every SDR program needs its own dongle. Give each dongle a unique serial
 # number (rtl_eeprom -s) and set the *_SDR_SERIAL variables in .env.
+#
+# Any of these can run on the master or on a node, except `lora`: ChirpStack
+# needs the master's database, so it runs on the master.
 
 x-env: &env
+  NODE_NAME: ${NODE_NAME:-master}
   DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sigint}
   MQTT_HOST: broker
   MQTT_PORT: "1883"
+  MQTT_USERNAME: ${MQTT_USERNAME:-local}
+  MQTT_PASSWORD: ${MQTT_PASSWORD}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 x-broker: &needs-broker
@@ -61,8 +67,11 @@ services:
     command: ["python", "kismet_bridge.py"]
     network_mode: host  # reaches Kismet and the broker through the host
     environment:
+      NODE_NAME: ${NODE_NAME:-master}
       MQTT_HOST: 127.0.0.1
       MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-local}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       KISMET_URL: http://127.0.0.1:${KISMET_PORT:-2501}
       KISMET_USER: ${KISMET_USER:-sigint}
@@ -90,6 +99,8 @@ services:
       POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
       REDIS_HOST: chirpstack-redis
       MQTT_BROKER_HOST: broker
+      MQTT_USERNAME: ${MQTT_USERNAME:-local}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
       CHIRPSTACK_API_SECRET: ${CHIRPSTACK_API_SECRET:?set CHIRPSTACK_API_SECRET in .env}
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${CHIRPSTACK_PORT:-8090}:8080"
@@ -111,6 +122,8 @@ services:
       INTEGRATION__MQTT__EVENT_TOPIC_TEMPLATE: ${LORA_REGION:-eu868}/gateway/{{ .GatewayID }}/event/{{ .EventType }}
       INTEGRATION__MQTT__STATE_TOPIC_TEMPLATE: ${LORA_REGION:-eu868}/gateway/{{ .GatewayID }}/state/{{ .StateType }}
       INTEGRATION__MQTT__COMMAND_TOPIC_TEMPLATE: ${LORA_REGION:-eu868}/gateway/{{ .GatewayID }}/command/#
+      INTEGRATION__MQTT__AUTH__GENERIC__USERNAME: ${MQTT_USERNAME:-local}
+      INTEGRATION__MQTT__AUTH__GENERIC__PASSWORD: ${MQTT_PASSWORD}
     ports:
       # Gateways are on your network, so this listens on all interfaces by default.
       - "${LORA_BIND_ADDRESS:-0.0.0.0}:1700:1700/udp"
@@ -173,9 +186,11 @@ services:
       - >-
         exec /usr/bin/AIS-catcher $${AIS_SDR_SERIAL:+-d $$AIS_SDR_SERIAL}
         -N 8100
-        -Q mqtt://broker:1883 TOPIC sigint/ais/data/ship MSGFORMAT JSON_FULL
+        -Q mqtt://$${MQTT_USERNAME}:$${MQTT_PASSWORD}@broker:1883 TOPIC sigint/${NODE_NAME:-master}/ais/data/ship MSGFORMAT JSON_FULL
         $$AIS_ARGS
     environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-local}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
       AIS_SDR_SERIAL: ${AIS_SDR_SERIAL:-}
       AIS_ARGS: ${AIS_ARGS:-}
     ports:
@@ -189,6 +204,9 @@ services:
     build: services/rtl433
     environment:
       MQTT_HOST: broker
+      MQTT_USERNAME: ${MQTT_USERNAME:-local}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      NODE_NAME: ${NODE_NAME:-master}
       RTL433_SDR_SERIAL: ${RTL433_SDR_SERIAL:-}
       RTL433_ARGS: ${RTL433_ARGS:-}
     depends_on: *needs-broker

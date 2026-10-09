@@ -19,7 +19,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
 from sigint_common import cmd_topic, data_topic
-from sigint_common.config import DATABASE_URL, MQTT_HOST, MQTT_PASSWORD, MQTT_PORT, MQTT_USERNAME
+from sigint_common.config import DATABASE_URL, MQTT_HOST, MQTT_PASSWORD, MQTT_PORT, MQTT_USERNAME, NODE_NAME
 
 log = logging.getLogger("api")
 
@@ -83,13 +83,32 @@ async def health():
     return {"database": "ok", "bus": "ok" if bus.is_connected() else "down"}
 
 
+@app.get("/api/nodes")
+async def list_nodes():
+    """Every node (device) and whether it is currently linked to the master."""
+    return await query(
+        """SELECT n.node, n.status, n.first_seen, n.last_seen,
+                  count(m.name) FILTER (WHERE m.status = 'online') AS modules_online,
+                  count(m.name) AS modules_total
+           FROM modules n
+           LEFT JOIN modules m ON m.node = n.node AND m.name <> 'node'
+           WHERE n.name = 'node'
+           GROUP BY n.node, n.status, n.first_seen, n.last_seen
+           ORDER BY n.node <> %s, n.node""",
+        (NODE_NAME,),
+    )
+
+
 @app.get("/api/modules")
-async def list_modules():
-    return await query("SELECT * FROM modules ORDER BY name")
+async def list_modules(node: str | None = None):
+    if node:
+        return await query("SELECT * FROM modules WHERE node = %s AND name <> 'node' ORDER BY name", (node,))
+    return await query("SELECT * FROM modules WHERE name <> 'node' ORDER BY node, name")
 
 
 @app.get("/api/events")
 async def list_events(
+    node: str | None = None,
     module: str | None = None,
     kind: str | None = None,
     since: datetime | None = None,
@@ -98,6 +117,9 @@ async def list_events(
     limit: int = Query(100, ge=1, le=1000),
 ):
     where, params = [], {}
+    if node:
+        where.append("node = %(node)s")
+        params["node"] = node
     if module:
         where.append("module = %(module)s")
         params["module"] = module
@@ -135,10 +157,10 @@ async def get_event(event_id: int):
 @app.get("/api/stats")
 async def stats():
     return await query(
-        """SELECT module, kind, count(*) AS total,
+        """SELECT node, module, kind, count(*) AS total,
                   count(*) FILTER (WHERE ts > now() - interval '1 hour') AS last_hour,
                   max(ts) AS last_ts
-           FROM events GROUP BY module, kind ORDER BY module, kind"""
+           FROM events GROUP BY node, module, kind ORDER BY node, module, kind"""
     )
 
 
@@ -148,19 +170,29 @@ class PublishRequest(BaseModel):
     module: str
     kind: str
     data: Any
+    node: str = NODE_NAME
 
 
 @app.post("/api/publish", status_code=202)
 async def publish_data(req: PublishRequest):
     """Publish data onto the bus as if it came from `module` (the ingestor stores it)."""
-    publish(data_topic(req.module, req.kind), req.data)
-    return {"published": data_topic(req.module, req.kind)}
+    topic = data_topic(req.module, req.kind, req.node)
+    publish(topic, req.data)
+    return {"published": topic}
+
+
+@app.post("/api/nodes/{node}/modules/{name}/commands/{command}", status_code=202)
+async def send_command(node: str, name: str, command: str, body: dict[str, Any] | None = None):
+    """Send a command to a module on any node (delivered over the node's link)."""
+    topic = cmd_topic(name, command, node)
+    publish(topic, body or {})
+    return {"published": topic}
 
 
 @app.post("/api/modules/{name}/commands/{command}", status_code=202)
-async def send_command(name: str, command: str, body: dict[str, Any] | None = None):
-    publish(cmd_topic(name, command), body or {})
-    return {"published": cmd_topic(name, command)}
+async def send_command_master(name: str, command: str, body: dict[str, Any] | None = None):
+    """Shortcut for a module on the master."""
+    return await send_command(NODE_NAME, name, command, body)
 
 
 @app.get("/api/kv/{namespace}")

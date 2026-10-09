@@ -3,11 +3,11 @@
 ChirpStack's MQTT integration publishes on the shared broker at
   application/<application_id>/device/<dev_eui>/event/<event>
 and this bridge republishes each one as
-  sigint/chirpstack/data/<event>     (up, join, status, ack, txack, log, location, integration)
+  sigint/<node>/chirpstack/data/<event>     (up, join, status, ack, txack, log, location, integration)
 so the ingestor stores it and other modules can react to it.
 
 Commands:
-  sigint/chirpstack/cmd/downlink  {"application_id": "...", "dev_eui": "...",
+  sigint/<node>/chirpstack/cmd/downlink  {"application_id": "...", "dev_eui": "...",
                                    "f_port": 10, "data": "<base64>", "confirmed": false}
 """
 

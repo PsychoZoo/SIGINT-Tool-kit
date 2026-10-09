@@ -10,4 +10,6 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or None
 TOPIC_ROOT = os.environ.get("SIGINT_TOPIC_ROOT", "sigint")
+# Which device this program runs on; the master is "master" by default.
+NODE_NAME = os.environ.get("NODE_NAME", "master")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()

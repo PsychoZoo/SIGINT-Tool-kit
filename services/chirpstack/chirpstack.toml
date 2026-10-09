@@ -1,5 +1,6 @@
 # ChirpStack v4 configuration, adapted from github.com/chirpstack/chirpstack-docker
-# (MIT, see LICENSE.chirpstack-docker). The region_*.toml files are unchanged copies.
+# (MIT, see LICENSE.chirpstack-docker). The region_*.toml files are copies with
+# the gateway backend's MQTT username/password filled in from the environment.
 # $VARIABLES are filled in from the container environment (see integrations.yml).
 
 [logging]
@@ -45,10 +46,12 @@
 
 # Device events go to the shared broker on
 # application/<application_id>/device/<dev_eui>/event/<event>; the chirpstack
-# bridge republishes them as sigint/chirpstack/data/<event> so they are stored.
+# bridge republishes them as sigint/<node>/chirpstack/data/<event> so they are stored.
 [integration]
   enabled=["mqtt"]
 
   [integration.mqtt]
     server="tcp://$MQTT_BROKER_HOST:1883/"
+    username="$MQTT_USERNAME"
+    password="$MQTT_PASSWORD"
     json=true

@@ -7,6 +7,11 @@ Each program runs in its own Docker container. They all share:
 - **One message bus** (MQTT), which programs use to send data, commands and alerts to each other in real time.
 - **One API and dashboard**, where you can see what is running and watch data arrive live.
 
+It can run on one machine, or across [many devices](#multiple-devices-master-and-nodes):
+one **master** holds the database and dashboard, and any number of **nodes**
+(for example Raspberry Pis with radios) send everything they collect to it, over
+your local network or through Cloudflare.
+
 ```
  ┌────────┐ ┌──────────┐ ┌───────────────┐ ┌───────────┐ ┌─────────────┐
  │ Kismet │ │ChirpStack│ │ SDR: ADS-B,   │ │ watchlist │ │ your module │   programs
@@ -57,7 +62,7 @@ included (for example `docker compose --profile kismet up -d`).
 |---|---|
 | `db` | PostgreSQL 16, the central database (`db/init/01_schema.sql`) |
 | `broker` | Mosquitto MQTT broker (port 1883, WebSockets on 9001) |
-| `ingestor` | Saves every message on `sigint/+/data/#` to the `events` table and tracks modules |
+| `ingestor` | Saves every message on `sigint/+/+/data/#`, from every node, to the `events` table and tracks modules and nodes |
 | `api` | REST API, live WebSocket feed and the web dashboard |
 | `simulator` *(profile `demo`)* | Generates fake data so you can try everything without hardware |
 | `watchlist` *(module)* | Example of programs talking to each other: it raises alerts on matching data |
@@ -124,7 +129,8 @@ the shared MQTT broker, plus its own Redis.
 4. Point the gateway's packet forwarder at this machine's IP address, UDP port 1700.
 
 Every uplink, join and status event is stored as `chirpstack` / `up`, `join`, ...
-To send a downlink from any module or the API:
+ChirpStack runs on the master (it needs the database); gateways anywhere can
+point at it. To send a downlink from any module or the API:
 
 ```bash
 curl -X POST localhost:8080/api/modules/chirpstack/commands/downlink -H 'content-type: application/json' \
@@ -134,18 +140,108 @@ curl -X POST localhost:8080/api/modules/chirpstack/commands/downlink -H 'content
 If your database was created before the `lora` integration existed, run
 `./toolkit.sh migrate` once to create the `chirpstack` database.
 
+## Multiple devices (master and nodes)
+
+Every device runs this same repository in one of two roles:
+
+| Role | Runs | Stores data |
+|---|---|---|
+| **master** (one) | Database, ingestor, API and dashboard, broker, plus any programs | Everything from every device |
+| **node** (any number) | Broker that links to the master, plus any programs (Kismet, SDR tools, your modules...) | Nothing permanently. It buffers on disk while the master is unreachable. |
+
+```
+   node "roof-pi"              master                       node "van"
+ ┌────────────────┐     ┌──────────────────────┐     ┌────────────────┐
+ │ adsb ais kismet│     │ database   dashboard │     │ kismet aprs    │
+ │     broker ────┼────▶│ broker (port 1884)   │◀────┼──── broker     │
+ └────────────────┘     │ ingestor  watchlist  │     └────────────────┘
+          local network └──────────────────────┘ Cloudflare Tunnel
+```
+
+- **Data** from every node goes to the master and is stored with the node's name.
+- **Commands** go from the master (or from any node) to a module on a specific node.
+- **Alerts** from the watchlist go back to all nodes, and nodes can receive
+  any other topics they want (`NODE_IMPORT_TOPICS`).
+- **If the link drops**, the node keeps collecting and queues everything on
+  disk. When the link returns, the data is delivered and stored with the time it
+  was collected, not the time it arrived. The dashboard shows each node as online
+  or offline.
+- **Each node has its own login** and can only publish data under its own
+  name. A node that is lost or stolen can be locked out with `remove-node`.
+
+### Setting it up
+
+On the **master** (the device that keeps the data):
+
+```bash
+./toolkit.sh up            # plus any programs it should run itself, e.g. ./toolkit.sh up adsb
+./toolkit.sh add-node roof-pi
+```
+
+`add-node` creates a login for the node and prints the exact command to run on it:
+
+```bash
+# on the new device, after cloning this repository
+./toolkit.sh join --name roof-pi --master 192.168.1.10:1884 --password <printed password>
+./toolkit.sh up adsb ais   # whatever programs this node should run
+```
+
+Then:
+- `./toolkit.sh nodes` on the master lists the nodes and whether they're connected.
+- `./toolkit.sh role` shows a device's role.
+- `./toolkit.sh remove-node roof-pi` revokes a node's login.
+
+Nodes connect to the master on port **1884** (`NODE_PORT`). The master listens on
+it on all network interfaces (`NODE_LISTEN_ADDRESS`), so open it in the
+master's firewall for your LAN. Nothing on a node needs to be reachable.
+
+### Cloudflare
+
+To link nodes that aren't on the master's network, without opening any ports,
+use a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
+
+1. In the Cloudflare dashboard, go to **Zero Trust → Networks → Tunnels**. Create a
+   tunnel (connector type *cloudflared*) and copy its token.
+2. Add a **public hostname** to the tunnel, for example `mqtt.example.com`, with
+   service type **TCP** and URL **`broker:1884`**.
+3. On the master, set these in `.env` and restart:
+   ```ini
+   CLOUDFLARE_TUNNEL_TOKEN=<token>
+   MASTER_CLOUDFLARE_HOSTNAME=mqtt.example.com
+   ```
+   `./toolkit.sh up` now also starts `cloudflared`, and `add-node` prints a
+   Cloudflare join command:
+   ```bash
+   ./toolkit.sh join --name van --master mqtt.example.com --cloudflare --password <printed password>
+   ```
+4. Optional but recommended: protect the hostname with a **Cloudflare Access**
+   application and a **service token** policy, then pass the token when joining
+   with `--cf-client-id <id> --cf-client-secret <secret>`.
+
+On the node, a `master-link` container (`cloudflared access tcp`) opens the local
+end of the tunnel, and the node's broker links through it. The node's own login
+still applies on top of Cloudflare.
+
+To reach the **dashboard** remotely as well, add a second public hostname with
+service **HTTP** and URL **`api:8080`**. Always protect that one with Cloudflare
+Access, because the API has no login of its own.
+
 ## How programs talk to each other
 
-Every program follows the same MQTT topic layout:
+Every program follows the same MQTT topic layout, where `<node>` is the device
+it runs on (`NODE_NAME`, `master` on the master):
 
 | Topic | Meaning |
 |---|---|
-| `sigint/<module>/data/<kind>` | Data a module produced. The ingestor **stores** it in the database. |
-| `sigint/<module>/cmd/<command>` | A command sent **to** a module |
-| `sigint/<module>/status` | Retained `online`/`offline` status, sent automatically |
+| `sigint/<node>/<module>/data/<kind>` | Data a module produced. The ingestor **stores** it in the database. |
+| `sigint/<node>/<module>/cmd/<command>` | A command sent **to** a module |
+| `sigint/<node>/<module>/status` | Retained `online`/`offline` status, sent automatically |
+| `sigint/<node>/node/status` | `1`/`0`: whether the node is linked to the master |
 
 Payloads are JSON. So any program, in any language, can join by publishing JSON
-to `sigint/<its name>/data/<kind>`. `rtl_433` does this with no extra code.
+to `sigint/<node>/<its name>/data/<kind>`. `rtl_433` does this with no extra code.
+Programs log in to their device's broker with `MQTT_USERNAME` / `MQTT_PASSWORD`
+from `.env`.
 
 For example, with the demo running:
 
@@ -160,16 +256,17 @@ curl -X POST localhost:8080/api/modules/watchlist/commands/add \
 # from ADS-B, a ship "mmsi" from AIS, or an APRS "source" callsign.
 curl 'localhost:8080/api/events?module=watchlist&kind=alert&limit=5'
 
-# Control another module
+# Control a module on the master, or on any node
 curl -X POST localhost:8080/api/modules/simulator/commands/set_rate -d '{"rate": 5}' -H 'content-type: application/json'
+curl -X POST localhost:8080/api/nodes/roof-pi/modules/simulator/commands/pause -d '{}' -H 'content-type: application/json'
 ```
 
 ## The central database
 
 | Table | Contents |
 |---|---|
-| `events` | Every data message: `id, ts, module, kind, topic, data (jsonb)` |
-| `modules` | Every program seen: status, kind, metadata, first and last seen |
+| `events` | Every data message: `id, ts, received, node, module, kind, topic, data (jsonb)`. `ts` is when it was collected, `received` when it reached the master |
+| `modules` | Every program seen, per node: status, kind, metadata, first and last seen. The row named `node` is the node's link to the master |
 | `kv` | Shared key/value store for config and state (`namespace, key, value`) |
 
 Modules can also create their own tables, as `watchlist` does. Each insert into
@@ -179,7 +276,7 @@ SQL as well as from MQTT.
 Example queries (`./toolkit.sh psql`):
 
 ```sql
-SELECT module, kind, count(*) FROM events GROUP BY 1, 2;
+SELECT node, module, kind, count(*) FROM events GROUP BY 1, 2, 3;
 SELECT ts, data->>'callsign', data->>'altitude_ft' FROM events
  WHERE kind = 'adsb' AND data @> '{"callsign": "BAW123"}' ORDER BY ts DESC LIMIT 20;
 ```
@@ -189,12 +286,14 @@ SELECT ts, data->>'callsign', data->>'altitude_ft' FROM events
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/health` | Database and bus status |
-| `GET /api/modules` | All modules and their status |
-| `GET /api/events?module=&kind=&since=&after_id=&contains=&limit=` | Query stored events (`contains` is a JSON filter) |
+| `GET /api/nodes` | All nodes, whether they are linked, and how many modules are online |
+| `GET /api/modules?node=` | All modules and their status |
+| `GET /api/events?node=&module=&kind=&since=&after_id=&contains=&limit=` | Query stored events (`contains` is a JSON filter) |
 | `GET /api/events/{id}` | One event |
-| `GET /api/stats` | Event counts per module and kind |
-| `POST /api/publish` | Publish `{module, kind, data}` onto the bus |
-| `POST /api/modules/{name}/commands/{command}` | Send a command to a module |
+| `GET /api/stats` | Event counts per node, module and kind |
+| `POST /api/publish` | Publish `{module, kind, data, node}` onto the bus |
+| `POST /api/nodes/{node}/modules/{name}/commands/{command}` | Send a command to a module on any node |
+| `POST /api/modules/{name}/commands/{command}` | Same, for a module on the master |
 | `GET /api/kv/{namespace}` / `PUT /api/kv/{namespace}/{key}` | Shared key/value store |
 | `WS /api/live` | Stream of new events as they are stored |
 
@@ -213,11 +312,11 @@ from sigint_common import Module
 
 mod = Module("wifi-scanner", kind="sensor")
 
-@mod.on("sigint/+/data/adsb")         # listen to another module's data
+@mod.on("sigint/+/+/data/adsb")       # listen to other modules' data, on any node
 def on_adsb(msg):
     print(msg.module, msg.data["callsign"])
 
-@mod.command("scan")                  # POST /api/modules/wifi-scanner/commands/scan
+@mod.command("scan")                  # POST /api/nodes/<node>/modules/wifi-scanner/commands/scan
 def scan(msg):
     mod.publish("ap", {"bssid": "...", "ssid": "..."})   # stored in the events table
 
@@ -233,7 +332,7 @@ mod.run_forever(loop)
 There are three ways to plug in an existing tool, all used by the integrations:
 
 - **It can publish MQTT itself:** point it at the broker on
-  `sigint/<name>/data/<kind>` (`rtl_433`, AIS-catcher).
+  `sigint/<node>/<name>/data/<kind>` (`rtl_433`, AIS-catcher).
 - **It has an API or network output:** write a small bridge that reads from
   it and calls `mod.publish()` (`services/bridges/` for Kismet, ADS-B and ChirpStack).
 - **It's a command-line tool:** run it from a Python module and parse its
@@ -246,10 +345,16 @@ To use real hardware, pass the device to the container in `modules/compose.yml`
 ## Security notes
 
 - The database, broker, API and integration web UIs listen on `127.0.0.1`
-  only by default (ChirpStack's gateway port 1700/udp listens on all
-  interfaces, set by `LORA_BIND_ADDRESS`, so your gateways can reach it). Before
-  setting `BIND_ADDRESS=0.0.0.0`, add a Mosquitto `password_file`
-  (`broker/mosquitto.conf`) and put the API behind authentication. The API has
-  no login of its own.
+  only by default. Two ports listen on all interfaces so other devices can reach
+  them:
+  - the master's node port 1884 (`NODE_LISTEN_ADDRESS`);
+  - ChirpStack's gateway port 1700/udp (`LORA_BIND_ADDRESS`).
+- Every connection to the master's broker needs a login: an internal account
+  for the master's own programs, and one per node. Each node may publish only
+  under its own name. On the local network that traffic is not encrypted, so
+  use Cloudflare (which encrypts it) for nodes on networks you don't trust.
+- The API has no login of its own. Before setting `BIND_ADDRESS=0.0.0.0` or
+  publishing the dashboard through Cloudflare, put it behind authentication
+  (for example Cloudflare Access).
 - Only collect and decode signals you are legally permitted to receive in your
   jurisdiction.

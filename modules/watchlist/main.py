@@ -1,14 +1,15 @@
 """Watchlist: an example of modules talking to each other.
 
-It listens to every other module's data on the bus, checks each message against
-a watchlist kept in its own database table, and publishes an `alert` event when
-something matches. Other modules (or the dashboard) can react to those alerts by
-subscribing to sigint/watchlist/data/alert.
+It runs on the master, listens to every module's data from every node, checks
+each message against a watchlist kept in its own database table, and publishes
+an `alert` event when something matches. Other modules (or the dashboard) can
+react to those alerts by subscribing to sigint/+/watchlist/data/alert; nodes
+receive alerts over their link by default.
 
-Commands:
-    sigint/watchlist/cmd/add     {"value": "BAW123", "field": "callsign", "note": "..."}
-    sigint/watchlist/cmd/remove  {"value": "BAW123"}
-    sigint/watchlist/cmd/reload  {}
+Commands (sigint/master/watchlist/cmd/...):
+    add     {"value": "BAW123", "field": "callsign", "note": "..."}
+    remove  {"value": "BAW123"}
+    reload  {}
 """
 
 from sigint_common import ALL_DATA, Message, Module
@@ -51,14 +52,15 @@ def flatten(data, prefix: str = ""):
 
 @mod.on(ALL_DATA)
 def check(msg: Message) -> None:
-    if msg.module == mod.name or not entries:
+    if msg.module == mod.name or not entries:  # never alert on alerts
         return
     for field, value in flatten(msg.data):
         for entry in entries:
             if entry["value"] == value and entry["field"] in (None, field):
                 mod.publish("alert", {
                     "match": entry["value"], "field": field, "note": entry["note"],
-                    "source_module": msg.module, "source_kind": msg.name, "event": msg.data,
+                    "source_node": msg.node, "source_module": msg.module, "source_kind": msg.name,
+                    "event": msg.data,
                 })
 
 

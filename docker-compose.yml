@@ -2,14 +2,25 @@
 # SDR tools) and modules/compose.yml (your own programs) automatically, via
 # COMPOSE_FILE in .env.
 #
+# Every device runs this same stack in one of two roles (ROLE in .env):
+#   master  the central database, ingestor, API/dashboard and broker
+#   node    only a broker that links to the master, plus whichever programs you
+#           start on it (./toolkit.sh join sets a device up as a node)
+#
+# The role's services are selected with profiles (COMPOSE_PROFILES in .env), so
+# plain `docker compose up -d` does the right thing on either kind of device.
+#
 #   docker compose up -d                     core + your modules
 #   docker compose --profile demo up -d      + simulator (fake data, no hardware)
 #   docker compose --profile kismet up -d    + integrations, see integrations.yml
 
 x-sigint-env: &sigint-env
+  NODE_NAME: ${NODE_NAME:-master}
   DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-sigint}
   MQTT_HOST: broker
   MQTT_PORT: "1883"
+  MQTT_USERNAME: ${MQTT_USERNAME:-local}
+  MQTT_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 x-sigint-depends: &sigint-depends
@@ -20,6 +31,7 @@ x-sigint-depends: &sigint-depends
 
 services:
   db:
+    profiles: ["master"]
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -37,22 +49,37 @@ services:
       timeout: 3s
       retries: 20
 
+  # Runs on every device; broker/entrypoint.sh configures it for the role.
   broker:
     image: eclipse-mosquitto:2
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "/broker/entrypoint.sh"]
+    environment:
+      ROLE: ${ROLE:-master}
+      NODE_NAME: ${NODE_NAME:-master}
+      MQTT_USERNAME: ${MQTT_USERNAME:-local}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      # node only:
+      MASTER_ADDRESS: ${MASTER_ADDRESS:-}
+      NODE_PASSWORD: ${NODE_PASSWORD:-}
+      NODE_IMPORT_TOPICS: ${NODE_IMPORT_TOPICS:-}
     volumes:
-      - ./broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./broker:/broker:ro
+      - ./broker/auth:/mosquitto/auth
       - broker-data:/mosquitto/data
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_PORT:-1883}:1883"
       - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_WS_PORT:-9001}:9001"
+      # Master only: nodes connect here. Listens on the LAN by default.
+      - "${NODE_LISTEN_ADDRESS:-0.0.0.0}:${NODE_PORT:-1884}:1884"
     healthcheck:
-      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      test: ["CMD-SHELL", "mosquitto_pub -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t health/broker -m ok"]
       interval: 5s
       timeout: 5s
       retries: 20
 
   ingestor:
+    profiles: ["master"]
     build:
       context: .
       dockerfile: services/ingestor/Dockerfile
@@ -63,6 +90,7 @@ services:
     depends_on: *sigint-depends
 
   api:
+    profiles: ["master"]
     build:
       context: .
       dockerfile: services/api/Dockerfile
@@ -81,7 +109,36 @@ services:
     environment:
       <<: *sigint-env
       SIM_RATE: ${SIM_RATE:-1}
-    depends_on: *sigint-depends
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  # -- Cloudflare --------------------------------------------------------------
+  # Master: publishes the node port (and optionally the dashboard) through a
+  # Cloudflare Tunnel, so nodes can reach the master from anywhere without any
+  # open ports. See "Cloudflare" in the README.
+  cloudflared:
+    profiles: ["cloudflare-tunnel"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  # Node: opens a local end of the tunnel to the master's broker, which the
+  # node's broker bridges through (MASTER_ADDRESS=master-link:1884).
+  master-link:
+    profiles: ["cloudflare-access"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: access tcp --hostname ${MASTER_CLOUDFLARE_HOSTNAME:-} --url 0.0.0.0:1884
+    environment:
+      # Cloudflare Access service token, if the hostname is protected by Access.
+      TUNNEL_SERVICE_TOKEN_ID: ${CLOUDFLARE_ACCESS_CLIENT_ID:-}
+      TUNNEL_SERVICE_TOKEN_SECRET: ${CLOUDFLARE_ACCESS_CLIENT_SECRET:-}
 
 volumes:
   db-data:
