@@ -5,5 +5,6 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends rtl-433 \
  && rm -rf /var/lib/apt/lists/*
-ENV MQTT_HOST=broker MQTT_PORT=1883 RTL433_ARGS=""
-CMD ["sh", "-c", "exec rtl_433 -M time:iso -M level -F \"mqtt://${MQTT_HOST}:${MQTT_PORT},retain=0,events=sigint/rtl433/data/ism\" -F kv ${RTL433_ARGS}"]
+ENV MQTT_HOST=broker MQTT_PORT=1883 RTL433_SDR_SERIAL="" RTL433_ARGS=""
+# -d :SERIAL picks the dongle by serial number; omitted, the first dongle is used.
+CMD ["sh", "-c", "exec rtl_433 ${RTL433_SDR_SERIAL:+-d :$RTL433_SDR_SERIAL} -M time:iso -M level -F \"mqtt://${MQTT_HOST}:${MQTT_PORT},retain=0,events=sigint/rtl433/data/ism\" ${RTL433_ARGS}"]

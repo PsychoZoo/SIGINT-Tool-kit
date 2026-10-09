@@ -1,9 +1,10 @@
-# Core platform. Your own programs live in modules/compose.yml, which docker
-# compose merges in automatically via COMPOSE_FILE in .env.
+# Core platform. Docker compose merges in integrations.yml (Kismet, ChirpStack,
+# SDR tools) and modules/compose.yml (your own programs) automatically, via
+# COMPOSE_FILE in .env.
 #
-#   docker compose up -d                     core + modules
+#   docker compose up -d                     core + your modules
 #   docker compose --profile demo up -d      + simulator (fake data, no hardware)
-#   docker compose --profile sdr up -d       + rtl_433 (needs an RTL-SDR dongle)
+#   docker compose --profile kismet up -d    + integrations, see integrations.yml
 
 x-sigint-env: &sigint-env
   DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-sigint}
@@ -81,19 +82,6 @@ services:
       <<: *sigint-env
       SIM_RATE: ${SIM_RATE:-1}
     depends_on: *sigint-depends
-
-  rtl433:
-    profiles: ["sdr"]
-    build: services/rtl433
-    restart: unless-stopped
-    environment:
-      MQTT_HOST: broker
-      RTL433_ARGS: ${RTL433_ARGS:-}
-    devices:
-      - /dev/bus/usb:/dev/bus/usb
-    depends_on:
-      broker:
-        condition: service_healthy
 
 volumes:
   db-data:

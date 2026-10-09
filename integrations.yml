@@ -1,0 +1,212 @@
+# Third-party programs wired into the toolkit. Each one is off until you enable
+# its profile, e.g. `./toolkit.sh up kismet adsb` or `docker compose --profile lora up -d`.
+#
+#   kismet   Kismet wireless monitor (Wi-Fi, Bluetooth) + bridge into the database
+#   lora     ChirpStack LoRaWAN network server + gateway bridge + bridge into the database
+#   adsb     Aircraft (ADS-B 1090 MHz) via readsb/tar1090 + bridge     needs an RTL-SDR
+#   ais      Ships (AIS 162 MHz) via AIS-catcher                       needs an RTL-SDR
+#   ism      433/868/915 MHz sensors via rtl_433                       needs an RTL-SDR
+#   aprs     Amateur-radio APRS packets via rtl_fm + multimon-ng       needs an RTL-SDR
+#   sdr      all four SDR tools (needs four dongles)
+#   all      everything
+#
+# Every SDR program needs its own dongle. Give each dongle a unique serial
+# number (rtl_eeprom -s) and set the *_SDR_SERIAL variables in .env.
+
+x-env: &env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sigint}
+  MQTT_HOST: broker
+  MQTT_PORT: "1883"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-broker: &needs-broker
+  broker:
+    condition: service_healthy
+
+# Pass USB SDR dongles through, and keep working if one is re-plugged.
+x-sdr: &sdr
+  restart: unless-stopped
+  device_cgroup_rules: ["c 189:* rwm"]
+  volumes:
+    - /dev/bus/usb:/dev/bus/usb
+
+x-bridge: &bridge
+  build:
+    context: .
+    dockerfile: services/bridges/Dockerfile
+  restart: unless-stopped
+
+services:
+  # -- Kismet ------------------------------------------------------------------
+  # Kismet uses the host network so it can see and control your Wi-Fi and
+  # Bluetooth adapters. Its web UI is at http://localhost:${KISMET_PORT:-2501}.
+  kismet:
+    profiles: ["kismet", "all"]
+    build: services/kismet
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    environment:
+      KISMET_USER: ${KISMET_USER:-sigint}
+      KISMET_PASSWORD: ${KISMET_PASSWORD:?set KISMET_PASSWORD in .env}
+      KISMET_SOURCES: ${KISMET_SOURCES:-}
+      KISMET_BIND_ADDRESS: ${BIND_ADDRESS:-127.0.0.1}
+      KISMET_PORT: ${KISMET_PORT:-2501}
+    volumes:
+      - kismet-data:/data
+
+  kismet-bridge:
+    <<: *bridge
+    profiles: ["kismet", "all"]
+    command: ["python", "kismet_bridge.py"]
+    network_mode: host  # reaches Kismet and the broker through the host
+    environment:
+      MQTT_HOST: 127.0.0.1
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      KISMET_URL: http://127.0.0.1:${KISMET_PORT:-2501}
+      KISMET_USER: ${KISMET_USER:-sigint}
+      KISMET_PASSWORD: ${KISMET_PASSWORD}
+      KISMET_POLL_SECONDS: ${KISMET_POLL_SECONDS:-30}
+    depends_on:
+      kismet:
+        condition: service_started
+      broker:
+        condition: service_healthy
+
+  # -- ChirpStack (LoRaWAN) ----------------------------------------------------
+  # Web UI at http://localhost:${CHIRPSTACK_PORT:-8090} (first login admin/admin).
+  # Point your gateways' Semtech UDP packet forwarder at this host, port 1700.
+  chirpstack:
+    profiles: ["lora", "all"]
+    image: chirpstack/chirpstack:4
+    command: -c /etc/chirpstack
+    restart: unless-stopped
+    volumes:
+      - ./services/chirpstack:/etc/chirpstack:ro
+    environment:
+      POSTGRESQL_HOST: db
+      POSTGRESQL_USER: ${POSTGRES_USER:-sigint}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: chirpstack-redis
+      MQTT_BROKER_HOST: broker
+      CHIRPSTACK_API_SECRET: ${CHIRPSTACK_API_SECRET:?set CHIRPSTACK_API_SECRET in .env}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${CHIRPSTACK_PORT:-8090}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      chirpstack-redis:
+        condition: service_started
+
+  chirpstack-gateway-bridge:
+    profiles: ["lora", "all"]
+    image: chirpstack/chirpstack-gateway-bridge:4
+    restart: unless-stopped
+    volumes:
+      - ./services/chirpstack-gateway-bridge:/etc/chirpstack-gateway-bridge:ro
+    environment:
+      INTEGRATION__MQTT__EVENT_TOPIC_TEMPLATE: ${LORA_REGION:-eu868}/gateway/{{ .GatewayID }}/event/{{ .EventType }}
+      INTEGRATION__MQTT__STATE_TOPIC_TEMPLATE: ${LORA_REGION:-eu868}/gateway/{{ .GatewayID }}/state/{{ .StateType }}
+      INTEGRATION__MQTT__COMMAND_TOPIC_TEMPLATE: ${LORA_REGION:-eu868}/gateway/{{ .GatewayID }}/command/#
+    ports:
+      # Gateways are on your network, so this listens on all interfaces by default.
+      - "${LORA_BIND_ADDRESS:-0.0.0.0}:1700:1700/udp"
+    depends_on: *needs-broker
+
+  chirpstack-redis:
+    profiles: ["lora", "all"]
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 300 1 --save 60 100 --appendonly no
+    volumes:
+      - chirpstack-redis:/data
+
+  chirpstack-bridge:
+    <<: *bridge
+    profiles: ["lora", "all"]
+    command: ["python", "chirpstack_bridge.py"]
+    environment: *env
+    depends_on: *needs-broker
+
+  # -- ADS-B (aircraft) --------------------------------------------------------
+  # tar1090 map at http://localhost:${ADSB_MAP_PORT:-8078}
+  ultrafeeder:
+    <<: *sdr
+    profiles: ["adsb", "sdr", "all"]
+    image: ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest
+    environment:
+      TZ: ${TZ:-UTC}
+      READSB_DEVICE_TYPE: rtlsdr
+      READSB_RTLSDR_DEVICE: ${ADSB_SDR_SERIAL:-}
+      READSB_GAIN: ${ADSB_GAIN:-auto}
+      READSB_LAT: ${STATION_LAT:-}
+      READSB_LON: ${STATION_LON:-}
+      # One position per aircraft every N seconds on the JSON stream the bridge reads.
+      READSB_EXTRA_ARGS: --net-json-port-interval=${ADSB_JSON_INTERVAL:-5}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${ADSB_MAP_PORT:-8078}:80"
+
+  adsb-bridge:
+    <<: *bridge
+    profiles: ["adsb", "sdr", "all"]
+    command: ["python", "adsb_bridge.py"]
+    environment:
+      <<: *env
+      ADSB_HOST: ultrafeeder
+    depends_on:
+      <<: *needs-broker
+      ultrafeeder:
+        condition: service_started
+
+  # -- AIS (ships) -------------------------------------------------------------
+  # AIS-catcher publishes straight to the broker; web viewer at
+  # http://localhost:${AIS_WEB_PORT:-8100}
+  ais:
+    <<: *sdr
+    profiles: ["ais", "sdr", "all"]
+    image: ghcr.io/jvde-github/ais-catcher:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        exec /usr/bin/AIS-catcher $${AIS_SDR_SERIAL:+-d $$AIS_SDR_SERIAL}
+        -N 8100
+        -Q mqtt://broker:1883 TOPIC sigint/ais/data/ship MSGFORMAT JSON_FULL
+        $$AIS_ARGS
+    environment:
+      AIS_SDR_SERIAL: ${AIS_SDR_SERIAL:-}
+      AIS_ARGS: ${AIS_ARGS:-}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${AIS_WEB_PORT:-8100}:8100"
+    depends_on: *needs-broker
+
+  # -- ISM band sensors (rtl_433) ------------------------------------------------
+  rtl433:
+    <<: *sdr
+    profiles: ["ism", "sdr", "all"]
+    build: services/rtl433
+    environment:
+      MQTT_HOST: broker
+      RTL433_SDR_SERIAL: ${RTL433_SDR_SERIAL:-}
+      RTL433_ARGS: ${RTL433_ARGS:-}
+    depends_on: *needs-broker
+
+  # -- APRS ----------------------------------------------------------------------
+  aprs:
+    <<: *sdr
+    profiles: ["aprs", "sdr", "all"]
+    build:
+      context: .
+      dockerfile: services/aprs/Dockerfile
+    environment:
+      <<: *env
+      APRS_FREQ: ${APRS_FREQ:-144.390M}
+      APRS_GAIN: ${APRS_GAIN:-42}
+      APRS_SDR_SERIAL: ${APRS_SDR_SERIAL:-}
+    depends_on: *needs-broker
+
+volumes:
+  kismet-data:
+  chirpstack-redis:

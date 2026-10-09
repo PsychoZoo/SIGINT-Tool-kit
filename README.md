@@ -8,11 +8,13 @@ Each program runs in its own Docker container. They all share:
 - **One API and dashboard**, where you can see what is running and watch data arrive live.
 
 ```
- ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌──────────────┐
- │ rtl_433  │  │simulator │  │ watchlist │  │ your module  │   programs
- └────┬─────┘  └────┬─────┘  └─────┬─────┘  └──────┬───────┘
-      │ publish / subscribe (MQTT topics sigint/...) │
- ─────┴─────────────┴──────────────┴───────────────┴───────  broker (Mosquitto)
+ ┌────────┐ ┌──────────┐ ┌───────────────┐ ┌───────────┐ ┌─────────────┐
+ │ Kismet │ │ChirpStack│ │ SDR: ADS-B,   │ │ watchlist │ │ your module │   programs
+ │        │ │ (LoRaWAN)│ │ AIS, rtl_433, │ │           │ │             │
+ │        │ │          │ │ APRS          │ │           │ │             │
+ └───┬────┘ └────┬─────┘ └──────┬────────┘ └─────┬─────┘ └──────┬──────┘
+     │ publish / subscribe (MQTT topics sigint/...)           │
+ ────┴───────────┴──────────────┴───────────────┴──────────────┴───  broker (Mosquitto)
                     │                         │
               ┌─────┴─────┐            ┌──────┴──────┐
               │ ingestor  │──writes──▶ │  PostgreSQL │◀── SQL from any module
@@ -37,7 +39,7 @@ Open <http://localhost:8080> for the dashboard and <http://localhost:8080/docs> 
 |---|---|
 | `./toolkit.sh up` | Start the core stack and your modules |
 | `./toolkit.sh up demo` | Also start the simulator (fake ADS-B, Wi-Fi and 433 MHz data) |
-| `./toolkit.sh up sdr` | Also start `rtl_433` on a USB RTL-SDR dongle |
+| `./toolkit.sh up kismet lora adsb` | Also start any of the [integrations](#integrations): `kismet`, `lora`, `adsb`, `ais`, `ism`, `aprs`, `sdr` (all four SDR tools) or `all` |
 | `./toolkit.sh status` / `logs [service]` | Show what is running, or follow its logs |
 | `./toolkit.sh psql` | Open a SQL shell on the central database |
 | `./toolkit.sh new-module <name>` | Create a new program from the template |
@@ -45,8 +47,9 @@ Open <http://localhost:8080> for the dashboard and <http://localhost:8080/docs> 
 | `./toolkit.sh reset` | Stop everything and delete all data |
 
 On the first run, `toolkit.sh` creates `.env` from `.env.example` with a random
-database password. Plain `docker compose ...` commands work too, because `.env`
-sets `COMPOSE_FILE` so your modules are always included.
+database password and other secrets. Plain `docker compose ...` commands work too,
+because `.env` sets `COMPOSE_FILE` so the integrations and your modules are always
+included (for example `docker compose --profile kismet up -d`).
 
 ## What's included
 
@@ -57,8 +60,79 @@ sets `COMPOSE_FILE` so your modules are always included.
 | `ingestor` | Saves every message on `sigint/+/data/#` to the `events` table and tracks modules |
 | `api` | REST API, live WebSocket feed and the web dashboard |
 | `simulator` *(profile `demo`)* | Generates fake data so you can try everything without hardware |
-| `rtl433` *(profile `sdr`)* | [rtl_433](https://github.com/merbanan/rtl_433) decoder for 433/868/915 MHz devices |
 | `watchlist` *(module)* | Example of programs talking to each other: it raises alerts on matching data |
+
+Plus the integrations below, each off until you enable its profile.
+
+## Integrations
+
+| Profile | Program | Hardware | Web UI | Stored as (module / kind) |
+|---|---|---|---|---|
+| `kismet` | [Kismet](https://www.kismetwireless.net/): Wi-Fi, Bluetooth and more | Wi-Fi adapter that supports monitor mode, Bluetooth adapter | `:2501` | `kismet` / `device`, `alert` |
+| `lora` | [ChirpStack](https://www.chirpstack.io/) v4 LoRaWAN network server and gateway bridge | A LoRaWAN gateway (Semtech UDP packet forwarder) | `:8090` | `chirpstack` / `up`, `join`, `status`, ... |
+| `adsb` | [readsb + tar1090](https://github.com/sdr-enthusiasts/docker-adsb-ultrafeeder): aircraft on 1090 MHz | RTL-SDR (+ 1090 MHz antenna) | `:8078` | `adsb` / `aircraft` |
+| `ais` | [AIS-catcher](https://github.com/jvde-github/AIS-catcher): ships on 162 MHz | RTL-SDR (+ VHF marine antenna) | `:8100` | `ais` / `ship` |
+| `ism` | [rtl_433](https://github.com/merbanan/rtl_433): weather stations, sensors, TPMS on 433/868/915 MHz | RTL-SDR | none | `rtl433` / `ism` |
+| `aprs` | rtl_fm + [multimon-ng](https://github.com/EliasOenal/multimon-ng): amateur-radio APRS on 144.39/144.8 MHz | RTL-SDR (+ 2 m antenna) | none | `aprs` / `packet` |
+
+`./toolkit.sh up` prints the web UI links for whatever it started. All settings are
+in `.env`, which is documented inline.
+
+### SDR dongles
+
+Each SDR program needs **its own** RTL-SDR, because only one program can use a
+dongle at a time. With more than one dongle plugged in, give each a unique serial
+number once, then tell each program which one to use:
+
+```bash
+rtl_eeprom -d 0 -s ADSB      # unplug all but one dongle each time, then replug
+rtl_eeprom -d 0 -s AIS
+```
+
+```ini
+# .env
+ADSB_SDR_SERIAL=ADSB
+AIS_SDR_SERIAL=AIS
+RTL433_SDR_SERIAL=ISM
+APRS_SDR_SERIAL=APRS
+```
+
+On the host, blacklist the DVB-T kernel driver so it doesn't grab the dongles:
+`echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/blacklist-rtlsdr.conf`, then reboot.
+
+### Kismet
+
+Set `KISMET_SOURCES` in `.env` to the adapters Kismet should capture from, for
+example `KISMET_SOURCES=wlan1 hci0`. Don't use the Wi-Fi adapter this machine
+uses for its own network connection: Kismet puts it in monitor mode. Kismet runs
+with host networking and privileged access so it can control the adapters, and
+its own `.kismet` log files are kept in the `kismet-data` volume. Log in to the
+web UI with `KISMET_USER` and the `KISMET_PASSWORD` that `.env` generated.
+
+The `kismet` bridge polls Kismet every `KISMET_POLL_SECONDS` and stores every
+device seen in that window (MAC, name, SSID, type, manufacturer, channel,
+signal, location if Kismet has GPS) plus every Kismet alert.
+
+### ChirpStack (LoRaWAN)
+
+ChirpStack uses the shared Postgres server (its own `chirpstack` database) and
+the shared MQTT broker, plus its own Redis.
+
+1. Set `LORA_REGION` in `.env` to your gateways' region (`eu868`, `us915_0`, `us915_1`, `au915_0`, ...).
+2. `./toolkit.sh up lora`, then open http://localhost:8090 and log in as `admin` / `admin`. Change the password.
+3. Add your gateway, a device profile, an application and devices in the UI.
+4. Point the gateway's packet forwarder at this machine's IP address, UDP port 1700.
+
+Every uplink, join and status event is stored as `chirpstack` / `up`, `join`, ...
+To send a downlink from any module or the API:
+
+```bash
+curl -X POST localhost:8080/api/modules/chirpstack/commands/downlink -H 'content-type: application/json' \
+     -d '{"application_id": "<uuid>", "dev_eui": "0102030405060708", "f_port": 10, "data": "AQI="}'
+```
+
+If your database was created before the `lora` integration existed, run
+`./toolkit.sh migrate` once to create the `chirpstack` database.
 
 ## How programs talk to each other
 
@@ -82,6 +156,8 @@ curl -X POST localhost:8080/api/modules/watchlist/commands/add \
 
 # The simulator publishes BAW123 positions, watchlist matches them and publishes
 # alerts, the ingestor stores those, and they appear in red on the dashboard.
+# The same works on real data: a MAC address from Kismet, an aircraft "hex"
+# from ADS-B, a ship "mmsi" from AIS, or an APRS "source" callsign.
 curl 'localhost:8080/api/events?module=watchlist&kind=alert&limit=5'
 
 # Control another module
@@ -154,9 +230,14 @@ def loop():
 mod.run_forever(loop)
 ```
 
-To wrap an existing tool that isn't written in Python, give it its own
-Dockerfile (see `services/rtl433/`) and point its output at the broker on
-`sigint/<name>/data/<kind>`, or pipe its output through a small Python module.
+There are three ways to plug in an existing tool, all used by the integrations:
+
+- **It can publish MQTT itself:** point it at the broker on
+  `sigint/<name>/data/<kind>` (`rtl_433`, AIS-catcher).
+- **It has an API or network output:** write a small bridge that reads from
+  it and calls `mod.publish()` (`services/bridges/` for Kismet, ADS-B and ChirpStack).
+- **It's a command-line tool:** run it from a Python module and parse its
+  output (`services/aprs/aprs.py`).
 
 To use real hardware, pass the device to the container in `modules/compose.yml`
 (for example `devices: ["/dev/bus/usb:/dev/bus/usb"]` for SDR dongles, or
@@ -164,7 +245,9 @@ To use real hardware, pass the device to the container in `modules/compose.yml`
 
 ## Security notes
 
-- The database, broker and API listen on `127.0.0.1` only by default. Before
+- The database, broker, API and integration web UIs listen on `127.0.0.1`
+  only by default (ChirpStack's gateway port 1700/udp listens on all
+  interfaces, set by `LORA_BIND_ADDRESS`, so your gateways can reach it). Before
   setting `BIND_ADDRESS=0.0.0.0`, add a Mosquitto `password_file`
   (`broker/mosquitto.conf`) and put the API behind authentication. The API has
   no login of its own.

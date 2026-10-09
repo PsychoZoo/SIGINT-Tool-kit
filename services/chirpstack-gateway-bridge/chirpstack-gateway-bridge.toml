@@ -1,0 +1,9 @@
+# Receives Semtech UDP packet-forwarder traffic from LoRa gateways on port 1700
+# and relays it over the shared MQTT broker. Topic templates are set from
+# LORA_REGION in integrations.yml.
+# See https://www.chirpstack.io/docs/chirpstack-gateway-bridge/configuration.html
+
+[integration.mqtt.auth.generic]
+servers=["tcp://broker:1883"]
+username=""
+password=""
