@@ -1,0 +1,175 @@
+# Core platform. Docker compose merges in integrations.yml (Kismet, ChirpStack,
+# SDR tools) and modules/compose.yml (your own programs) automatically, via
+# COMPOSE_FILE in .env.
+#
+# Every device runs this same stack in one of two roles (ROLE in .env):
+#   master  the central database, ingestor, API/dashboard and broker
+#   node    only a broker that links to the master, plus whichever programs you
+#           start on it (./toolkit.sh join sets a device up as a node)
+#
+# The role's services are selected with profiles (COMPOSE_PROFILES in .env), so
+# plain `docker compose up -d` does the right thing on either kind of device.
+#
+#   docker compose up -d                     core + your modules
+#   docker compose --profile demo up -d      + simulator (fake data, no hardware)
+#   docker compose --profile kismet up -d    + integrations, see integrations.yml
+
+x-sigint-env: &sigint-env
+  NODE_NAME: ${NODE_NAME:-master}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-sigint}
+  MQTT_HOST: broker
+  MQTT_PORT: "1883"
+  MQTT_USERNAME: ${MQTT_USERNAME:-local}
+  MQTT_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-sigint-depends: &sigint-depends
+  db:
+    condition: service_healthy
+  broker:
+    condition: service_healthy
+
+services:
+  db:
+    profiles: ["master"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sigint}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sigint}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Runs on every device; broker/entrypoint.sh configures it for the role.
+  broker:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/broker/entrypoint.sh"]
+    environment:
+      ROLE: ${ROLE:-master}
+      NODE_NAME: ${NODE_NAME:-master}
+      MQTT_USERNAME: ${MQTT_USERNAME:-local}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      # node only:
+      MASTER_ADDRESS: ${MASTER_ADDRESS:-}
+      NODE_PASSWORD: ${NODE_PASSWORD:-}
+      NODE_IMPORT_TOPICS: ${NODE_IMPORT_TOPICS:-}
+    volumes:
+      - ./broker:/broker:ro
+      - ./broker/auth:/mosquitto/auth
+      - broker-data:/mosquitto/data
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_PORT:-1883}:1883"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_WS_PORT:-9001}:9001"
+      # Master only: nodes connect here. Listens on the LAN by default.
+      - "${NODE_LISTEN_ADDRESS:-0.0.0.0}:${NODE_PORT:-1884}:1884"
+    networks: [default, edge]  # edge: nodes through the Cloudflare tunnel
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t health/broker -m ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ingestor:
+    profiles: ["master"]
+    build:
+      context: .
+      dockerfile: services/ingestor/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *sigint-env
+      EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-0}
+    depends_on: *sigint-depends
+
+  api:
+    profiles: ["master"]
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment: &api-env
+      <<: *sigint-env
+      # Anything that looks proxied must carry a valid Cloudflare Access login
+      # for this application (services/api/access.py).
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
+      DASHBOARD_CLOUDFLARE_HOSTNAME: ${DASHBOARD_CLOUDFLARE_HOSTNAME:-}
+    depends_on: *sigint-depends
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080"
+
+  # The dashboard for the internet: the same API, but every request needs a
+  # Cloudflare Access login. No host port; only cloudflared can reach it, on the
+  # "edge" network, and cloudflared can't reach the login-free api above.
+  # Route the dashboard hostname to http://api-public:8080 in the tunnel.
+  api-public:
+    profiles: ["cloudflare-tunnel"]
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *api-env
+      API_REQUIRE_ACCESS: "1"
+    depends_on: *sigint-depends
+    networks: [default, edge]
+
+  simulator:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *sigint-env
+      SIM_RATE: ${SIM_RATE:-1}
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  # -- Cloudflare --------------------------------------------------------------
+  # Master: publishes the node port (and optionally the dashboard) through a
+  # Cloudflare Tunnel, so nodes can reach the master from anywhere without any
+  # open ports. See "Cloudflare" in the README.
+  cloudflared:
+    profiles: ["cloudflare-tunnel"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    # Only the edge network: it reaches broker (nodes) and api-public (dashboard),
+    # nothing else on this machine.
+    networks: [edge]
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  # Node: opens a local end of the tunnel to the master's broker, which the
+  # node's broker bridges through (MASTER_ADDRESS=master-link:1884).
+  master-link:
+    profiles: ["cloudflare-access"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: access tcp --hostname ${MASTER_CLOUDFLARE_HOSTNAME:-} --url 0.0.0.0:1884
+    environment:
+      # Cloudflare Access service token, if the hostname is protected by Access.
+      TUNNEL_SERVICE_TOKEN_ID: ${CLOUDFLARE_ACCESS_CLIENT_ID:-}
+      TUNNEL_SERVICE_TOKEN_SECRET: ${CLOUDFLARE_ACCESS_CLIENT_SECRET:-}
+
+volumes:
+  db-data:
+  broker-data:
+
+networks:
+  # What cloudflared (the tunnel) can reach: broker and api-public only.
+  edge:

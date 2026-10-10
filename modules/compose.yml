@@ -1,0 +1,31 @@
+# Your own programs. Merged with ../docker-compose.yml via COMPOSE_FILE in .env,
+# so paths here are relative to the repository root.
+# `./toolkit.sh new-module <name>` appends a new service to the end of this file.
+
+# Modules run on whichever device you start them on (master or node). The
+# database only exists on the master; add `profiles: ["master"]` to a module
+# that needs it, as watchlist does.
+x-module: &module
+  restart: unless-stopped
+  environment:
+    NODE_NAME: ${NODE_NAME:-master}
+    DATABASE_URL: postgresql://${POSTGRES_USER:-sigint}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sigint}
+    MQTT_HOST: broker
+    MQTT_PORT: "1883"
+    MQTT_USERNAME: ${MQTT_USERNAME:-local}
+    MQTT_PASSWORD: ${MQTT_PASSWORD}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    db:
+      condition: service_healthy
+      required: false  # not present on nodes
+    broker:
+      condition: service_healthy
+
+services:
+  watchlist:
+    <<: *module
+    profiles: ["master"]  # keeps its watchlist in the master's database
+    build:
+      context: .
+      dockerfile: modules/watchlist/Dockerfile

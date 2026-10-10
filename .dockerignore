@@ -1,0 +1,7 @@
+.git
+.env
+**/__pycache__
+**/*.pyc
+# Flash images (GBs, and they hold node and Wi-Fi passwords) and broker logins
+images/
+broker/auth/
