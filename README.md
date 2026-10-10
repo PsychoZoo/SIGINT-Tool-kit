@@ -32,7 +32,15 @@ your local network or through Cloudflare.
 
 ## Quick start
 
-You need Docker with the Compose plugin.
+The fastest way to set up a master is the guided setup. It installs Docker if
+needed, asks a few questions, starts everything, and then offers to
+[flash ready-to-run nodes](#flash-ready-to-run-nodes):
+
+```bash
+./toolkit.sh setup
+```
+
+Or, if you already have Docker with the Compose plugin:
 
 ```bash
 ./toolkit.sh up demo     # start everything plus a simulator that generates fake data
@@ -193,7 +201,56 @@ Then:
 
 Nodes connect to the master on port **1884** (`NODE_PORT`). The master listens on
 it on all network interfaces (`NODE_LISTEN_ADDRESS`), so open it in the
-master's firewall for your LAN. Nothing on a node needs to be reachable.
+master's firewall for your LAN if it filters Docker's published ports (ufw and
+firewalld usually don't: Docker opens them itself). To accept nodes on one
+address only, set `NODE_LISTEN_ADDRESS` to it. Nothing on a node needs to be reachable.
+
+### Flash ready-to-run nodes
+
+Instead of setting nodes up by hand, the master can write a complete,
+preconfigured system to an SD card or USB drive. Put it in the device, power it
+on, and it joins the master by itself: nobody has to log in.
+
+```bash
+./toolkit.sh flash-node
+```
+
+It asks for the node's name, its programs, your Wi-Fi details and an SSH key
+(answers are remembered for next time), creates the node's login, builds the
+system and writes it to the card you pick. At the end it offers to flash another
+node with the same settings, so two Raspberry Pis take two cards and a few minutes.
+
+| Device | `--target` | What the card holds | What happens |
+|---|---|---|---|
+| Raspberry Pi 3, 4, 5, Zero 2 W | `pi` | Official Raspberry Pi OS Lite (64-bit) + cloud-init settings | Boots, connects (Wi-Fi or Ethernet), installs Docker, joins, starts its programs |
+| Any x86-64 PC | `pc` | Official Debian installer, fully automatic | **Erases the PC's internal disk**, installs Debian and **powers off**. Remove the USB drive, power on: it installs Docker, joins, starts its programs |
+
+- The first start needs internet once and takes 10-20 minutes (Docker and the
+  program images are downloaded). Then the node appears in `./toolkit.sh nodes`
+  and on the dashboard, and it comes back by itself after every reboot.
+- Progress on the node: `journalctl -u sigint-firstboot` (or
+  `/var/log/sigint-firstboot.log`). Log in with
+  `ssh -i ~/.ssh/sigint_nodes sigint@<name>.local`; password login is disabled.
+  By default nodes get a dedicated key, `~/.ssh/sigint_nodes` (made on first use),
+  rather than your personal one: it gives passwordless root on every node.
+- Only SD cards, USB drives and other removable disks are offered for writing,
+  never a disk this machine is using. You type the device name to confirm, and
+  the disk is checked again just before writing.
+- The PC installer only installs when the PC has exactly one internal disk (USB
+  disks are ignored), and stops if that disk already holds a SIGINT node, so
+  leaving the drive plugged in can't trigger a second install.
+- The base systems are downloaded once from raspberrypi.com / debian.org,
+  checked against their published SHA-256 sums, and cached in `images/cache/`.
+- Everything can be given as options for scripting, and `--image-only` just
+  builds `images/<name>-<target>.img|.iso` for Raspberry Pi Imager or balenaEtcher
+  ("Use custom"). See `./toolkit.sh flash-node --help`.
+
+The card or drive holds the node's password and your Wi-Fi password. Keep it
+private; if a device or card is lost, revoke it with `./toolkit.sh remove-node <name>`.
+A PC's installer drive keeps them after installing, so reflash or wipe it afterwards.
+If nodes connect through Cloudflare Access, they all share the master's Access
+service token (`CLOUDFLARE_ACCESS_CLIENT_ID/SECRET`): after losing a device,
+rotate it as well.
 
 ### Cloudflare
 
@@ -353,6 +410,9 @@ To use real hardware, pass the device to the container in `modules/compose.yml`
   for the master's own programs, and one per node. Each node may publish only
   under its own name. On the local network that traffic is not encrypted, so
   use Cloudflare (which encrypts it) for nodes on networks you don't trust.
+- Cards and drives made by `flash-node` (and the images in `images/`) contain
+  the node's broker password and your Wi-Fi password. Treat them like keys.
+  Nodes allow SSH only with the key you chose when flashing.
 - The API has no login of its own. Before setting `BIND_ADDRESS=0.0.0.0` or
   publishing the dashboard through Cloudflare, put it behind authentication
   (for example Cloudflare Access).

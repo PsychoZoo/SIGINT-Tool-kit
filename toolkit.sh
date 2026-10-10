@@ -21,6 +21,14 @@ Usage: ./toolkit.sh <command> [args]
   new-module <name>    Create modules/<name> from the template and add it to the stack
   reset                Stop everything and DELETE all stored data
 
+Setting up:
+  setup                Guided master setup: installs Docker if needed, asks a few
+                       questions, starts the master, then offers to flash nodes
+  flash-node [options] On the master: build a ready-to-run system for a new node
+                       and write it to an SD card or USB drive (Raspberry Pi or PC).
+                       See ./toolkit.sh flash-node --help
+  test                 Run the shell tests (in Docker)
+
 Multiple devices (one master, any number of nodes):
   add-node <name>      On the master: create a login for a node and print the
                        command to run on that node
@@ -44,18 +52,8 @@ NAME_RE='^[a-z0-9][a-z0-9_-]{0,31}$'
 
 random_secret() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-env_value() {  # env_value KEY DEFAULT
-  local v
-  v=$(grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2-)
-  v=${v#\"}; v=${v%\"}
-  echo "${v:-${2:-}}"
-}
-
-set_env() {  # set_env KEY VALUE
-  local rest
-  rest=$(grep -v -E "^$1=" .env || true)
-  printf '%s\n%s=%s\n' "$rest" "$1" "$2" > .env
-}
+# shellcheck source=scripts/env.sh
+source scripts/env.sh
 
 ensure_env() {
   if [[ ! -f .env ]]; then
@@ -185,6 +183,10 @@ case "$cmd" in
     password=$(random_secret)
     compose exec -T broker mosquitto_passwd -b /mosquitto/auth/passwd "$name" "$password"
     reload_broker
+    if [[ "${2:-}" == --password-only ]]; then  # used by flash-node
+      echo "$password"
+      exit 0
+    fi
     port=$(env_value NODE_PORT 1884)
     lan=$(lan_address)
     echo
@@ -226,7 +228,9 @@ case "$cmd" in
     ;;
   join)
     ensure_env
-    name="" master="" password="" cloudflare=0 cf_id="" cf_secret=""
+    # The password and secret can come from the environment instead of the
+    # command line, where other users could see them (flashed nodes do this).
+    name="" master="" password=${SIGINT_JOIN_PASSWORD:-} cloudflare=0 cf_id="" cf_secret=${SIGINT_JOIN_CF_SECRET:-}
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --name) name=$2; shift 2 ;;
@@ -283,6 +287,13 @@ case "$cmd" in
       dockerfile: modules/$name/Dockerfile
 EOF
     echo "Created modules/$name. Edit modules/$name/main.py, then run: ./toolkit.sh up"
+    ;;
+  setup)       exec scripts/setup.sh "$@" ;;
+  flash-node)  exec scripts/flash-node.sh "$@" ;;
+  test)
+    docker build -q --target test -t sigint-provision-test provision >/dev/null
+    docker run --rm -v "$PWD:/code:ro" -w /code sigint-provision-test \
+      sh -c 'shellcheck -x -S warning toolkit.sh scripts/*.sh provision/*.sh provision/pc/*.sh provision/firstboot/*.sh && bats tests'
     ;;
   reset)
     read -r -p "This deletes ALL stored data on this device. Type 'yes' to continue: " answer

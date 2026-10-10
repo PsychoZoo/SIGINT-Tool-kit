@@ -1,0 +1,17 @@
+[Unit]
+Description=SIGINT Tool-kit node first boot: install Docker, join the master, start programs
+Wants=network-online.target
+After=network-online.target cloud-init.target
+ConditionPathExists=!/var/lib/sigint/provisioned
+
+[Service]
+Type=oneshot
+# Run through bash: the files come from a FAT boot partition without exec bits.
+ExecStart=/bin/bash /opt/sigint-provision/sigint-firstboot.sh
+Restart=on-failure
+RestartSec=30
+# Downloading Docker and the program images can take a long time on a Pi.
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
