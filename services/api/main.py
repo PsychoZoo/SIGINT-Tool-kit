@@ -4,28 +4,42 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from datetime import datetime
+from urllib.parse import urlsplit
 from typing import Any
 
 import paho.mqtt.client as mqtt
 import psycopg
-from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from paho.mqtt.enums import CallbackAPIVersion
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
+from swagger_ui_bundle import swagger_ui_path
 
 from sigint_common import cmd_topic, data_topic
 from sigint_common.config import DATABASE_URL, MQTT_HOST, MQTT_PASSWORD, MQTT_PORT, MQTT_USERNAME, NODE_NAME
+
+from access import GUIDE_HINT, AccessDenied, AccessVerifier, access_token, came_through_proxy
+from guide import guide_page
 
 log = logging.getLogger("api")
 
 pool = AsyncConnectionPool(DATABASE_URL, open=False, kwargs={"autocommit": True, "row_factory": dict_row})
 bus = mqtt.Client(CallbackAPIVersion.VERSION2, client_id="api")
 live_clients: set[asyncio.Queue] = set()
+verifier = AccessVerifier.from_env()
+# api-public (the instance cloudflared reaches) sets this: every request needs a
+# Cloudflare Access login. The local instance requires it only for proxied requests.
+REQUIRE_ACCESS = os.environ.get("API_REQUIRE_ACCESS") == "1"
+DENIED = f"Cloudflare Access login required. {GUIDE_HINT}"
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 async def listen_for_events() -> None:
@@ -60,7 +74,48 @@ async def lifespan(app: FastAPI):
     await pool.close()
 
 
-app = FastAPI(title="SIGINT Tool-kit API", lifespan=lifespan)
+# docs_url=None: /docs is served below from bundled files instead of a CDN, so
+# it works with no internet.
+app = FastAPI(title="SIGINT Tool-kit API", lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+def needs_access(headers) -> bool:
+    return REQUIRE_ACCESS or came_through_proxy(headers)
+
+
+async def access_denied(headers, cookies, what: str) -> bool:
+    """True (and logged) if this request needs an Access login and lacks a valid one."""
+    if not needs_access(headers):
+        return False
+    try:
+        await verifier.verify(access_token(headers, cookies))
+        return False
+    except AccessDenied as exc:
+        log.warning("refused %s: %s", what, exc)
+        return True
+
+
+def cross_origin(headers) -> bool:
+    """A browser request started by another website (CSRF, WebSocket hijacking)."""
+    origin = headers.get("origin")
+    return bool(origin) and urlsplit(origin).netloc != headers.get("host")
+
+
+@app.middleware("http")
+async def protect(request: Request, call_next):
+    if await access_denied(request.headers, request.cookies, f"{request.method} {request.url.path}"):
+        return PlainTextResponse(DENIED, status_code=403)
+    if request.method not in SAFE_METHODS and cross_origin(request.headers):
+        return PlainTextResponse("Cross-site request refused.", status_code=403)
+    return await call_next(request)
+
+
+# Only answer to our own names: blocks DNS-rebinding attacks from web pages.
+ALLOWED_HOSTS = ["localhost", "127.0.0.1", "api", "api-public"] + [
+    h for h in [os.environ.get("DASHBOARD_CLOUDFLARE_HOSTNAME", "")] + os.environ.get("API_ALLOWED_HOSTS", "").split()
+    if h
+]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 
 async def query(sql: str, params: Any = None) -> list[dict]:
@@ -215,6 +270,10 @@ async def kv_put(namespace: str, key: str, value: Any = Body(...)):
 
 @app.websocket("/api/live")
 async def live(ws: WebSocket):
+    # HTTP middleware doesn't see WebSockets: apply the same rules here.
+    if cross_origin(ws.headers) or await access_denied(ws.headers, ws.cookies, "live feed"):
+        await ws.close(code=1008)  # policy violation
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=500)
     live_clients.add(queue)
@@ -233,6 +292,23 @@ async def live(ws: WebSocket):
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/swagger", StaticFiles(directory=swagger_ui_path), name="swagger")
+
+
+@app.get("/docs", include_in_schema=False)
+async def api_docs():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - API docs",
+        swagger_js_url="/swagger/swagger-ui-bundle.js",
+        swagger_css_url="/swagger/swagger-ui.css",
+        swagger_favicon_url="/swagger/favicon-32x32.png",
+    )
+
+
+@app.get("/guide", include_in_schema=False)
+async def guide():
+    return HTMLResponse(guide_page())
 
 
 @app.get("/", include_in_schema=False)

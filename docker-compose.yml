@@ -72,6 +72,7 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:${MQTT_WS_PORT:-9001}:9001"
       # Master only: nodes connect here. Listens on the LAN by default.
       - "${NODE_LISTEN_ADDRESS:-0.0.0.0}:${NODE_PORT:-1884}:1884"
+    networks: [default, edge]  # edge: nodes through the Cloudflare tunnel
     healthcheck:
       test: ["CMD-SHELL", "mosquitto_pub -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t health/broker -m ok"]
       interval: 5s
@@ -95,10 +96,32 @@ services:
       context: .
       dockerfile: services/api/Dockerfile
     restart: unless-stopped
-    environment: *sigint-env
+    environment: &api-env
+      <<: *sigint-env
+      # Anything that looks proxied must carry a valid Cloudflare Access login
+      # for this application (services/api/access.py).
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
+      DASHBOARD_CLOUDFLARE_HOSTNAME: ${DASHBOARD_CLOUDFLARE_HOSTNAME:-}
     depends_on: *sigint-depends
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080"
+
+  # The dashboard for the internet: the same API, but every request needs a
+  # Cloudflare Access login. No host port; only cloudflared can reach it, on the
+  # "edge" network, and cloudflared can't reach the login-free api above.
+  # Route the dashboard hostname to http://api-public:8080 in the tunnel.
+  api-public:
+    profiles: ["cloudflare-tunnel"]
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *api-env
+      API_REQUIRE_ACCESS: "1"
+    depends_on: *sigint-depends
+    networks: [default, edge]
 
   simulator:
     profiles: ["demo"]
@@ -124,6 +147,9 @@ services:
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    # Only the edge network: it reaches broker (nodes) and api-public (dashboard),
+    # nothing else on this machine.
+    networks: [edge]
     depends_on:
       broker:
         condition: service_healthy
@@ -143,3 +169,7 @@ services:
 volumes:
   db-data:
   broker-data:
+
+networks:
+  # What cloudflared (the tunnel) can reach: broker and api-public only.
+  edge:

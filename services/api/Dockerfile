@@ -6,5 +6,7 @@ COPY services/api/requirements.txt /tmp/requirements.txt
 RUN pip install /opt/sigint-lib -r /tmp/requirements.txt
 WORKDIR /app
 COPY services/api/ .
+# The guide, shown at /guide (works with no internet).
+COPY docs/GUIDE.md docs/GUIDE.md
 EXPOSE 8080
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

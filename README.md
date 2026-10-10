@@ -30,6 +30,10 @@ your local network or through Cloudflare.
                                        └─────────────┘
 ```
 
+> **Step-by-step guide:** [docs/GUIDE.md](docs/GUIDE.md): set up a master, flash
+> nodes, reach the dashboard from anywhere, troubleshooting. The same guide is
+> on every master at `http://localhost:8080/guide`, with no internet needed.
+
 ## Quick start
 
 The fastest way to set up a master is the guided setup. It installs Docker if
@@ -46,7 +50,8 @@ Or, if you already have Docker with the Compose plugin:
 ./toolkit.sh up demo     # start everything plus a simulator that generates fake data
 ```
 
-Open <http://localhost:8080> for the dashboard and <http://localhost:8080/docs> for the API.
+Open <http://localhost:8080> for the dashboard, <http://localhost:8080/guide> for the
+guide and <http://localhost:8080/docs> for the API. All three work without internet.
 
 | Command | What it does |
 |---|---|
@@ -280,8 +285,14 @@ end of the tunnel, and the node's broker links through it. The node's own login
 still applies on top of Cloudflare.
 
 To reach the **dashboard** remotely as well, add a second public hostname with
-service **HTTP** and URL **`api:8080`**. Always protect that one with Cloudflare
-Access, because the API has no login of its own.
+service **HTTP** and URL **`api-public:8080`**, protect it with a Cloudflare Access
+application, and give the master its team domain and AUD tag
+(`CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`; `./toolkit.sh setup` asks for them).
+`api-public` is a second copy of the API that checks the Access login on every
+request and refuses the rest, and the tunnel is on its own Docker network that
+can't reach the login-free local API. So a missing or wrong Access policy can't
+expose the dashboard.
+Step by step: [docs/GUIDE.md](docs/GUIDE.md#reach-the-dashboard-from-anywhere).
 
 ## How programs talk to each other
 
@@ -413,8 +424,9 @@ To use real hardware, pass the device to the container in `modules/compose.yml`
 - Cards and drives made by `flash-node` (and the images in `images/`) contain
   the node's broker password and your Wi-Fi password. Treat them like keys.
   Nodes allow SSH only with the key you chose when flashing.
-- The API has no login of its own. Before setting `BIND_ADDRESS=0.0.0.0` or
-  publishing the dashboard through Cloudflare, put it behind authentication
-  (for example Cloudflare Access).
+- The API has no login of its own; it listens on this machine only. Through
+  Cloudflare it requires a valid Cloudflare Access login (checked by the API
+  itself). Don't set `BIND_ADDRESS=0.0.0.0`: that would open it, unprotected,
+  to your network.
 - Only collect and decode signals you are legally permitted to receive in your
   jurisdiction.

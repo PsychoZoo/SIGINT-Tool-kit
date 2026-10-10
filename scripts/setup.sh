@@ -56,7 +56,7 @@ step_role() {
 }
 
 step_questions() {
-  local name cf_token cf_host
+  local name
   ask name "Name for this master" "$(env_value NODE_NAME master)"
   valid_node_name "$name" || die "name: lowercase letters, digits, - and _ (max 32)"
   set_env NODE_NAME "$name"
@@ -68,17 +68,46 @@ step_questions() {
     [[ " ${MASTER_PROGRAMS[*]} " == *" $p "* ]] || die "unknown program '$p'"
   done
   set_env SETUP_PROGRAMS "${programs:-none}"
+}
 
-  if yes_no "Also let nodes connect from outside this network through Cloudflare?" N; then
-    echo "See \"Cloudflare\" in the README for creating the tunnel."
-    ask cf_token "Cloudflare tunnel token" "$(env_value CLOUDFLARE_TUNNEL_TOKEN)"
-    ask cf_host "Public hostname routed to tcp://broker:1884 (e.g. mqtt.example.com)" "$(env_value MASTER_CLOUDFLARE_HOSTNAME)"
-    if ! valid_line "$cf_token" || [[ ! "$cf_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
-      die "invalid Cloudflare settings"
-    fi
-    set_env CLOUDFLARE_TUNNEL_TOKEN "$cf_token"
-    set_env MASTER_CLOUDFLARE_HOSTNAME "$cf_host"
-  fi
+has_setting() { [[ -n "$(env_value "$1")" ]] && echo Y || echo N; }
+
+valid_hostname() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; }
+
+# Everything through Cloudflare: nodes outside this network, and the dashboard
+# from anywhere. Both use one Cloudflare Tunnel. Details: docs/GUIDE.md.
+step_cloudflare() {
+  local nodes=0 dashboard=0 token
+  if yes_no "Let nodes connect from outside this network through Cloudflare?" "$(has_setting MASTER_CLOUDFLARE_HOSTNAME)"; then nodes=1; fi
+  if yes_no "Reach the dashboard from the internet (behind a Cloudflare Access login)?" "$(has_setting CF_ACCESS_AUD)"; then dashboard=1; fi
+  (( nodes || dashboard )) || return 0
+  echo "See docs/GUIDE.md (or http://localhost:8080/guide) for the Cloudflare steps."
+  ask token "Cloudflare tunnel token" "$(env_value CLOUDFLARE_TUNNEL_TOKEN)"
+  if [[ -z "$token" ]] || ! valid_line "$token"; then die "the tunnel token can't be empty"; fi
+  set_env CLOUDFLARE_TUNNEL_TOKEN "$token"
+  if (( nodes )); then ask_node_hostname; fi
+  if (( dashboard )); then ask_dashboard_access; fi
+}
+
+ask_node_hostname() {
+  local host
+  ask host "Public hostname routed to tcp://broker:1884 (e.g. mqtt.example.com)" "$(env_value MASTER_CLOUDFLARE_HOSTNAME)"
+  valid_hostname "$host" || die "not a hostname: $host"
+  set_env MASTER_CLOUDFLARE_HOSTNAME "$host"
+}
+
+ask_dashboard_access() {
+  local host team aud
+  ask host "Dashboard hostname routed to http://api-public:8080 (e.g. sigint.example.com)" "$(env_value DASHBOARD_CLOUDFLARE_HOSTNAME)"
+  valid_hostname "$host" || die "not a hostname: $host"
+  ask team "Cloudflare Access team domain (your-team.cloudflareaccess.com)" "$(env_value CF_ACCESS_TEAM_DOMAIN)"
+  team=${team#https://}; team=${team%/}
+  [[ "$team" =~ ^[A-Za-z0-9-]+\.cloudflareaccess\.com$ ]] || die "the team domain looks like your-team.cloudflareaccess.com"
+  ask aud "Access application's Audience (AUD) tag" "$(env_value CF_ACCESS_AUD)"
+  [[ "$aud" =~ ^[A-Za-z0-9]{16,128}$ ]] || die "the AUD tag is the long letters-and-digits value on the application's overview"
+  set_env DASHBOARD_CLOUDFLARE_HOSTNAME "$host"
+  set_env CF_ACCESS_TEAM_DOMAIN "$team"
+  set_env CF_ACCESS_AUD "$aud"
 }
 
 # Docker publishes the node port itself, past ufw/firewalld rules, so there is
@@ -95,6 +124,7 @@ main() {
   step_docker "$@"
   step_role
   step_questions
+  step_cloudflare
   note_node_port
   # shellcheck disable=SC2086  # programs is a space-separated list of profiles
   ./toolkit.sh up $programs

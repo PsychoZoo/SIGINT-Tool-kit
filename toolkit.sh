@@ -132,7 +132,10 @@ case "$cmd" in
     echo
     if [[ "$(role)" == master ]]; then
       port=$(env_value API_PORT 8080)
-      echo "Master '$(env_value NODE_NAME master)'. Dashboard: http://localhost:${port}   API docs: http://localhost:${port}/docs"
+      echo "Master '$(env_value NODE_NAME master)'. Dashboard: http://localhost:${port}   Guide: http://localhost:${port}/guide"
+      if [[ -n "$(env_value DASHBOARD_CLOUDFLARE_HOSTNAME)" ]]; then
+        echo "From anywhere (Cloudflare Access login): https://$(env_value DASHBOARD_CLOUDFLARE_HOSTNAME)"
+      fi
     else
       echo "Node '$(env_value NODE_NAME)', linked to the master at $(env_value MASTER_CLOUDFLARE_HOSTNAME "$(env_value MASTER_ADDRESS)")."
       echo "Its data appears on the master's dashboard. Check the link with: ./toolkit.sh logs broker"
@@ -294,6 +297,11 @@ EOF
     docker build -q --target test -t sigint-provision-test provision >/dev/null
     docker run --rm -v "$PWD:/code:ro" -w /code sigint-provision-test \
       sh -c 'shellcheck -x -S warning toolkit.sh scripts/*.sh provision/*.sh provision/pc/*.sh provision/firstboot/*.sh && bats tests'
+    docker build -q -f services/api/tests/Dockerfile -t sigint-api-test . >/dev/null
+    docker run --rm -v "$PWD:/code:ro" sigint-api-test
+    # The real API image must at least start: import it and render the guide.
+    docker build -q -f services/api/Dockerfile -t sigint-api-smoke . >/dev/null
+    docker run --rm sigint-api-smoke python -c 'import main, guide; assert "Guide not found" not in guide.guide_page(); print("api image: ok")'
     ;;
   reset)
     read -r -p "This deletes ALL stored data on this device. Type 'yes' to continue: " answer
